@@ -4,6 +4,9 @@ output: html_document
 date: '2022-07-18'
 ---
 ```{r warning=FALSE, message=FALSE}
+df_phenology <- readRDS("~/Downloads/pheno_lstm/pheno_lstm/df_phenology.rds")
+df_watch <- readRDS("~/Downloads/pheno_lstm/pheno_lstm/df_watch.rds")
+
 library(data.table)
 library(torch)
 library(tidyverse)
@@ -11,12 +14,28 @@ library(recipes)
 library(skimr)
 library(luz)
 library(tidytable)
-
-df_watch$target_var<-as.logical("FALSE")
-df_watch[which(df_watch$date%like%"12-31"),]$target_var<-as.logical("TRUE")
-df_watch[which(df_watch$date%like%"01-01"),]$target_var<-as.logical("TRUE")
-df<-df_watch
 ```
+
+
+```{r}
+define_first_day<-function(x){paste(x,"-01-01",sep="")}
+df_phenology$first_day<-sapply(df_phenology$year, define_first_day)
+
+eos_day<-c()
+for (i in 1:length(df_phenology$first_day)){
+  eday<-as.Date(df_phenology$first_day[i], format = "%Y-%m-%d")+df_phenology$eos[i]
+  eos_day<-c(eos_day,as.character(eday))}
+
+sos_day<-c()
+for (j in 1:length(df_phenology$first_day)){
+  sday<-as.Date(df_phenology$first_day[j], format = "%Y-%m-%d")+as.numeric(df_phenology$sos[j])
+  sos_day<-c(sos_day,as.character(sday))}
+
+df_phenology$eos_day<-eos_day
+df_phenology$sos_day<-sos_day
+
+```
+
 
 ```{r}
 #get a smaller dataset and add a new column named species by the year of that species exist on the site. 
@@ -38,40 +57,66 @@ for(i in 1:length(selected_sites)){
     species_insite_obs<-selected_df_watch[ind_starting_day:ind_ending_day,]
     species_insite_obs$species<-species_insite
     df_withspecies<-rbind(df_withspecies,species_insite_obs)
-} }
+  } }
 ```
 
 
+```{r}
+# this is the code for assigning target variable
+
+#df_withspecies<-df_withspecies%>%add_column(target = NA)
+
+#for (i in 1:nrow(df_withspecies)){
+#  row_date<-df_withspecies[i,]$date
+#  row_year<-year(row_date)
+#  row_site<-df_withspecies[i,]$sitename
+#  row_speices<-df_withspecies[i,]$species
+  
+#  criteria<-df_phenology[df_phenology$id_site==row_site&df_phenology$species==row_speices&df_phenology$year==row_year,]
+#  if (nrow(criteria)!=0){
+#    out<-row_date>criteria$sos_day&row_date<criteria$eos_day
+#    df_withspecies[i,]$target<-out
+#  }
+#}
+
+#df_withspecies<-df_withspecies[!is.na(df_withspecies$target), ]
+#saveRDS(df_withspecies,file="df_withspecies.Rda")
+
+```
+
+```{r}
+df_withtarget<-readRDS("~/Downloads/pheno_lstm/pheno_lstm/df_withspecies.Rda")
+```
 
 ```{r}
 # define time-depended variables and time-invariant variable
-vars <- c("sitename","rain","snow","prec","qair","temp","patm","vapr","vpd","target_var")
+vars <- c("sitename","rain","snow","prec","qair","temp","patm","vapr","vpd","target")
 vars_meta<-c("species")
 
 #one-hot encoding of the variable 
-meta_df<-df_withspecies%>%select(vars_meta)
+meta_df<-df_withtarget%>%select(vars_meta)
 meta_df<-get_dummies.(data.frame(meta_df))
 
 #seperating two dataframe
-meta_df$site<-df_withspecies$sitename
-sensor_df<-df_withspecies%>%select(vars)
+meta_df$site<-df_withtarget$sitename
+sensor_df<-df_withtarget%>%select(vars)
 
 ```
 
 ```{r}
-test_site<-"1"
+#assigning test site
+test_site<-"4"
 ddf_train<-sensor_df[sensor_df$sitename!=test_site,]
 ddf_test<-sensor_df[sensor_df$sitename==test_site,]
 
 meta_train<-meta_df[meta_df$site!=test_site,]
 meta_test<-meta_df[meta_df$site==test_site,]
-
 ```
 
 ```{r}
 #normalisaton
 myrecipe_ddf <- recipe(
-  target_var ~rain+ snow+ prec+qair+ temp +patm +vapr +vpd,
+  target ~rain+ snow+ prec+qair+ temp +patm +vapr +vpd,
   data = ddf_train) %>% 
   step_normalize(all_numeric(), id = "normalize")
 pp <- prep(myrecipe_ddf, training = ddf_train)
@@ -88,7 +133,7 @@ mymodule_generator_withcondition <- nn_module(
   initialize = function(input_dim, 
                         conditional_dim, # the dimension of the time-invariant dataset
                         hidden_dim, 
-                        num_layers = 2 #number of layer increases to 2 here to improve performance of the example
+                        num_layers = 1 #number of layer increases to 2 here to improve performance of the example
                         ){
     
     self$lstm <- nn_lstm(
@@ -141,64 +186,15 @@ mymodule_generator_withcondition <- nn_module(
 
 
 ```{r}
-hidden_dim= HIDDEN_DIM
-conditional_dim=CONDITIONAL_FEATURES
-lstm <- nn_lstm(
-      input_size = INPUT_FEATURES , 
-      hidden_size = HIDDEN_DIM, 
-      num_layers = 1
-      )
-fc1 <- nn_sequential(
-        nn_linear(
-           in_features = hidden_dim + conditional_dim, # the metadata are concatenated to the output of lstm here
-           out_features =64
-           ),
-         nn_relu()) 
-
-fc2 <- nn_sequential(nn_linear(in_features=64, 
-                                       out_features =64), 
-                              nn_relu()
-                              )
-    
-fc3 <- nn_sequential(nn_linear(in_features =64, 
-                                        out_features =16), 
-                              nn_relu()
-                              )
-fc4 <- nn_linear(16, 1)
-
-out <- lstm(torch_stack(x, 1)) 
-# take the output in hidden state
-out <- out[[1]]$squeeze(1) # squeeze here is to squeeze on the unused dimension
-
-# we concatenating the time-invariant variables to the outputs of LSTM when utilizing condition part of the model. 
-out <- torch_cat(list(out,c), dim = 2) 
-    
-# then this part is the same with last chapter
-y <- fc1(out)  
-y <- fc2(y)
-y <-fc3(y)
-y <- fc4(y)
-y<-torch_squeeze(y, 1)
-y<-torch_sigmoid(y)
-    
-
-
-```
-
-
-
-
-
-```{r}
 # fixed seed
 torch_manual_seed(40)
 # define number of epoch we want to run
-n_epochs <- 10
+n_epochs <- 30
 # the device we want to run the model
 DEVICE <- if (cuda_is_available()){c("cuda")} else {c("cpu")}
 # model parameters
 INPUT_FEATURES <- ncol(ddf_train_norm%>% 
-                         select(-c("target_var","sitename")))
+                         select(-c("target")))
 HIDDEN_DIM <- 256
 CONDITIONAL_FEATURES <- ncol(meta_train)-2
 ```
@@ -213,14 +209,14 @@ train_sites<-unique(ddf_train_norm$sitename)
 train_list<-vector(mode = "list", length = length(train_sites))
 for(i in 1:length(train_sites)){
   site_df<-ddf_train_norm[ddf_train_norm$sitename==train_sites[i],]
-  train_list[[i]]<-site_df%>%select(-"sitename","target_var")
+  train_list[[i]]<-site_df%>%select(-"sitename","target")
 }
 
 # wrap the gpp value by site
 target_train_list<-vector(mode = "list", length = length(train_sites))
 for(i in 1:length(train_sites)){
   site_df<-ddf_train_norm[ddf_train_norm$sitename==train_sites[i],]
-  target_train_list[[i]]<-site_df%>%select("target_var")
+  target_train_list[[i]]<-site_df%>%select("target")
 }
 
 #wrap the meta dataset by site
@@ -250,7 +246,7 @@ optimizer <- optim_adam(model_condition$parameters, lr = 0.0001)
 
 
 ```{r message=FALSE}
-library(easyr)
+#library(easyr)
 # training model with defined epochs
 r2 <- c()
 for (epoch in 1:n_epochs){
@@ -270,7 +266,7 @@ for (epoch in 1:n_epochs){
     y<-training_list$target_train_list
     c<-training_list$meta_list
     
-    x <- torch_tensor(x %>% select(-"target_var") 
+    x <- torch_tensor(x %>% select(-"target") 
                        %>%as.matrix(), 
                       dtype = torch_float()
                       )$to(device = DEVICE)
@@ -306,12 +302,13 @@ for (epoch in 1:n_epochs){
   # pass the test set into the model and compute the R2
   with_no_grad({
     x <- torch_tensor(ddf_test_norm%>% 
-                                select(-"target_var") %>% 
+                                select(-"target") %>% 
                                 as.matrix(), # x_test, 
                               dtype = torch_float()
                               )#$cuda()
     
     y <- torch_tensor(ddf_test_norm%>% 
+                                select("target") %>% 
                                 as.matrix(), # y_test, 
                               dtype = torch_float()
                               )#$cuda()
@@ -329,7 +326,16 @@ for (epoch in 1:n_epochs){
 
 
 
+```{r warning=FALSE}
+library(caret)
+Y_hat<-as.logical(torch_ge(y_pred, 0.5))
+Y<-ddf_test_norm%>%select("target")
 
+table(Y)  
+table(Y_hat)
+confusionMatrix(Y_hat, Y)
+
+```
 
 
 
