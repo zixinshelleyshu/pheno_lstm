@@ -39,7 +39,7 @@ df_phenology$sos_day<-sos_day
 
 ```{r}
 #get a smaller dataset and add a new column named species by the year of that species exist on the site. 
-selected_sites<-unique(df_phenology$id_site)[1:4]
+selected_sites<-unique(df_phenology$id_site)[1:6]
 df_withspecies<-c()
 for(i in 1:length(selected_sites)){
   selected_df_watch<-df_watch[df_watch$sitename==selected_sites[i],]
@@ -80,26 +80,28 @@ for(i in 1:length(selected_sites)){
 #}
 
 #df_withspecies<-df_withspecies[!is.na(df_withspecies$target), ]
-#saveRDS(df_withspecies,file="df_withspecies.Rda")
+#saveRDS(df_withspecies,file="df_withspecies_sixsites.Rda")
 
 ```
 
 ```{r}
-df_withtarget<-readRDS("~/Downloads/pheno_lstm/pheno_lstm/df_withspecies.Rda")
+df_withtarget<-readRDS("~/Downloads/pheno_lstm/pheno_lstm/df_withspecies_sixsites.Rda")
+df_onespecies<-df_withtarget[df_withtarget$species=="Aesculus hippocastanum",]
+
 ```
 
-```{r}
+```{r warning=FALSE}
 # define time-depended variables and time-invariant variable
 vars <- c("sitename","rain","snow","prec","qair","temp","patm","vapr","vpd","target")
 vars_meta<-c("species")
 
 #one-hot encoding of the variable 
-meta_df<-df_withtarget%>%select(vars_meta)
+meta_df<-df_onespecies%>%select(vars_meta)
 meta_df<-get_dummies.(data.frame(meta_df))
 
 #seperating two dataframe
-meta_df$site<-df_withtarget$sitename
-sensor_df<-df_withtarget%>%select(vars)
+meta_df$site<-df_onespecies$sitename
+sensor_df<-df_onespecies%>%select(vars)
 
 ```
 
@@ -133,7 +135,8 @@ mymodule_generator_withcondition <- nn_module(
   initialize = function(input_dim, 
                         conditional_dim, # the dimension of the time-invariant dataset
                         hidden_dim, 
-                        num_layers = 1 #number of layer increases to 2 here to improve performance of the example
+                        num_layers = 1, #number of layer increases to 2 here to improve performance of the example
+                        conditional=0
                         ){
     
     self$lstm <- nn_lstm(
@@ -141,25 +144,43 @@ mymodule_generator_withcondition <- nn_module(
       hidden_size = hidden_dim, 
       num_layers = num_layers
       )
-
+    
+    self$conditional <- conditional
     
     # the input dimension for the MLP is the output of LSTM plus the dimension of time-invariant dataset
-    self$fc1 <- nn_sequential(
+    if (self$conditional == 1){ 
+      self$fc1 <- nn_sequential(
         nn_linear(
            in_features = hidden_dim + conditional_dim, # the metadata are concatenated to the output of lstm here
-           out_features =64
+           out_features =256
            ),
          nn_relu()) 
-    self$fc2 <- nn_sequential(nn_linear(in_features=64, 
-                                       out_features =64), 
+    } else {# optionally when we do not indicate the use of condition the model is similar to chapter 1
+       self$fc1 <- nn_sequential(
+         nn_linear(
+           in_features = hidden_dim, 
+           out_features =256), 
+         nn_relu()
+         )
+     }
+    
+    self$fc2 <- nn_sequential(nn_linear(in_features=256, 
+                                       out_features =128), 
                               nn_relu()
                               )
     
-    self$fc3 <- nn_sequential(nn_linear(in_features =64, 
-                                        out_features =16), 
+    self$fc3 <- nn_sequential(nn_linear(in_features =128, 
+                                        out_features =64), 
                               nn_relu()
                               )
-    self$fc4 <- nn_linear(16, 1)
+    self$fc4 <- nn_sequential(nn_linear(in_features =64, 
+                                        out_features =64), 
+                              nn_relu())
+   
+    self$fc5 <- nn_linear(64, 1)
+    
+    #self$sigmoid<-nn_sigmoid()
+    self$sigmoid<-nn_softmax(dim=1)
     
   },
   
@@ -170,16 +191,16 @@ mymodule_generator_withcondition <- nn_module(
     out <- out[[1]]$squeeze(1) # squeeze here is to squeeze on the unused dimension
     
     # we concatenating the time-invariant variables to the outputs of LSTM when utilizing condition part of the model. 
-    out <- torch_cat(list(out,c), dim = 2) 
+    if (self$conditional == 1){out <- torch_cat(list(out,c), dim = 2) }
     
     # then this part is the same with last chapter
     y <- self$fc1(out)  
     y <- self$fc2(y)
     y <- self$fc3(y)
     y <- self$fc4(y)
-    y<-torch_squeeze(y, 1)
-    y<-torch_sigmoid(y)
-    
+    y <- self$fc5(y)
+
+    y<-self$sigmoid(y)
   }
 )
 ```
@@ -189,7 +210,7 @@ mymodule_generator_withcondition <- nn_module(
 # fixed seed
 torch_manual_seed(40)
 # define number of epoch we want to run
-n_epochs <- 30
+n_epochs <- 40
 # the device we want to run the model
 DEVICE <- if (cuda_is_available()){c("cuda")} else {c("cpu")}
 # model parameters
@@ -237,22 +258,21 @@ model_condition<- mymodule_generator_withcondition(
   INPUT_FEATURES,
   CONDITIONAL_FEATURES,
   HIDDEN_DIM,
-  num_layers = 1
+  num_layers = 2, 
+  conditional=0
   )$to(device = DEVICE)
 # we use an optimizer called Adam
-optimizer <- optim_adam(model_condition$parameters, lr = 0.0001)
+optimizer <- optim_adam(model_condition$parameters, lr = 0.000001)
 
 ```
 
 
 ```{r message=FALSE}
-#library(easyr)
 # training model with defined epochs
 r2 <- c()
+train_loss <- 0.0
+criterion<-nn_bce_loss()
 for (epoch in 1:n_epochs){
-  
-  train_loss <- 0.0
-  train_r2 <- 0.0
   
   model_condition$train()
   
@@ -287,7 +307,7 @@ for (epoch in 1:n_epochs){
     
     optimizer$zero_grad()
     
-    loss <- nnf_binary_cross_entropy(y_pred,y) #changed to CE loss
+    loss <- nnf_binary_cross_entropy_with_logits(y_pred,y) #changed to CE loss
     
     # update the parameter after one site of data passing
     loss$backward()
@@ -320,21 +340,21 @@ for (epoch in 1:n_epochs){
     
             
     y_pred <- model_condition(x,c)
+    val_loss <- nnf_binary_cross_entropy(y_pred,y)
   })}
 
 ```
 
 
 
-```{r warning=FALSE}
+```{r warning=FALSE, message=FALSE}
 library(caret)
 Y_hat<-as.logical(torch_ge(y_pred, 0.5))
 Y<-ddf_test_norm%>%select("target")
 
 table(Y)  
 table(Y_hat)
-confusionMatrix(Y_hat, Y)
-
+#confusionMatrix(Y_hat, Y)
 ```
 
 
